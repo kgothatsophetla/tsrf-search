@@ -68,7 +68,9 @@ def get_model():
             if _model is None:
                 from fastembed import TextEmbedding
                 logger.info("Loading embedding model BAAI/bge-small-en-v1.5 ...")
-                _model = TextEmbedding("BAAI/bge-small-en-v1.5")
+                # Vercel's filesystem is read-only except /tmp — set cache there.
+                cache_dir = os.environ.get("FASTEMBED_CACHE_PATH", "/tmp/fastembed")
+                _model = TextEmbedding("BAAI/bge-small-en-v1.5", cache_dir=cache_dir)
                 logger.info("Embedding model loaded.")
     return _model
 
