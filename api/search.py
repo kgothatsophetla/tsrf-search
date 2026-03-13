@@ -216,8 +216,10 @@ class handler(BaseHTTPRequestHandler):
             logger.error("Corpus not found: %s", e)
             self._send_event({"type": "error", "message": str(e)})
         except Exception:
+            import traceback
+            err = traceback.format_exc()
             logger.exception("Search failed for query: %r", query)
-            self._send_event({"type": "error", "message": "Search failed"})
+            self._send_event({"type": "error", "message": f"Search failed: {err}"})
 
 
 # ---------------------------------------------------------------------------
