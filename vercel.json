@@ -1,9 +1,4 @@
 {
-  "functions": {
-    "api/search.py": {
-      "runtime": "python3.9"
-    }
-  },
   "rewrites": [
     {
       "source": "/api/:path*",
