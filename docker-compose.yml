@@ -1,0 +1,59 @@
+services:
+  # ---------------------------------------------------------------------------
+  # Python semantic search API (FastAPI + uvicorn)
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tsrf-search-api
+    ports:
+      - "8000:8000"
+    environment:
+      # CORS_ORIGINS must match the browser's origin (localhost:3000),
+      # NOT the Docker internal service name.
+      CORS_ORIGINS: "http://localhost:3000"
+      PYTHONUNBUFFERED: "1"
+      # Optional tuning — override these at runtime if needed:
+      # MIN_SCORE: "0.55"
+      # RATE_LIMIT: "30/minute"
+    volumes:
+      # Mount corpus read-only so you can re-run `python scripts/ingest.py`
+      # on the host and restart the container to pick up changes — no rebuild needed.
+      - ./data/chunks.json:/app/data/chunks.json:ro
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')",
+        ]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Next.js frontend
+  # ---------------------------------------------------------------------------
+  frontend:
+    image: node:20-alpine
+    working_dir: /app
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: development
+      # next.config.mjs reads API_ORIGIN to proxy /api/* to the Python service.
+      # Use the Docker service name here — this is container-to-container traffic.
+      API_ORIGIN: "http://api:8000"
+    volumes:
+      - .:/app
+      # Isolate container node_modules from the host to avoid platform conflicts.
+      - /app/node_modules
+    command: sh -c "npm install && npm run dev"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped

@@ -1,0 +1,9 @@
+fastembed>=0.2.0
+numpy>=1.24.0
+pymupdf>=1.23.0
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+mangum>=0.17.0
+pydantic>=2.0.0
+slowapi>=0.1.9
+python-multipart>=0.0.9

@@ -1,0 +1,13 @@
+{
+  "functions": {
+    "api/search.py": {
+      "runtime": "python3.12"
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/api/:path*",
+      "destination": "/api/search"
+    }
+  ]
+}
