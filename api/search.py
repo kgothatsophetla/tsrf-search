@@ -4,9 +4,11 @@ Python backend for semantic search.
 Vercel deployment:
     Vercel's Python runtime only supports BaseHTTPRequestHandler — not ASGI/Mangum.
     The `handler` class below is what Vercel invokes for every request.
+    Model + corpus are loaded at module level so they are ready before the first
+    request (Lambda INIT phase), eliminating first-request latency.
 
 Docker / local:
-    Uses FastAPI + uvicorn (full production features: rate limiting, validation, etc.)
+    Uses FastAPI + uvicorn (rate limiting, validation, etc.)
     python api/search.py          # runs uvicorn
     docker compose up
 
@@ -21,7 +23,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import threading
 from http.server import BaseHTTPRequestHandler
 from typing import AsyncGenerator
 
@@ -46,85 +47,63 @@ DATA_PATH = os.path.join(
     "data",
     "chunks.json",
 )
+_BUNDLED_MODELS = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "models",
+)
 MIN_SCORE: float = float(os.environ.get("MIN_SCORE", "0.55"))
 CORS_ORIGINS: str = os.environ.get("CORS_ORIGINS", "*")
 RATE_LIMIT: str = os.environ.get("RATE_LIMIT", "30/minute")
 
 # ---------------------------------------------------------------------------
-# Thread-safe lazy-loaded globals
+# Module-level initialisation
+# On Vercel/Lambda, module init runs in the INIT phase — before the first
+# request. Loading here means the first request pays no setup cost.
+# On plain uvicorn the effect is the same: ready before serving traffic.
 # ---------------------------------------------------------------------------
 
-_lock = threading.Lock()
-_model = None
-_corpus: list[dict] | None = None
-_corpus_matrix: np.ndarray | None = None
+logger.info("Initialising model and corpus ...")
 
+from fastembed import TextEmbedding  # noqa: E402
 
-def get_model():
-    """Return the embedding model, loading it once on first call."""
-    global _model
-    if _model is None:
-        with _lock:
-            if _model is None:
-                from fastembed import TextEmbedding
-                logger.info("Loading embedding model BAAI/bge-small-en-v1.5 ...")
-                # Use the bundled model directory so Vercel never downloads at runtime.
-                # Falls back to FASTEMBED_CACHE_PATH env var for local dev without the bundle.
-                _bundled = os.path.join(
-                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                    "models",
-                )
-                cache_dir = os.environ.get("FASTEMBED_CACHE_PATH", _bundled)
-                _model = TextEmbedding("BAAI/bge-small-en-v1.5", cache_dir=cache_dir)
-                logger.info("Embedding model loaded.")
-    return _model
+_model = TextEmbedding(
+    "BAAI/bge-small-en-v1.5",
+    cache_dir=os.environ.get("FASTEMBED_CACHE_PATH", _BUNDLED_MODELS),
+)
+logger.info("Model loaded.")
 
+if not os.path.exists(DATA_PATH):
+    raise FileNotFoundError(
+        f"Corpus not found at {DATA_PATH}. Run: python scripts/ingest.py"
+    )
+with open(DATA_PATH, encoding="utf-8") as _f:
+    _corpus: list[dict] = json.load(_f)
 
-def get_corpus() -> tuple[list[dict], np.ndarray]:
-    """Return (corpus, normalised_matrix), loading from disk once on first call."""
-    global _corpus, _corpus_matrix
-    if _corpus is None:
-        with _lock:
-            if _corpus is None:
-                if not os.path.exists(DATA_PATH):
-                    raise FileNotFoundError(
-                        f"Corpus not found at {DATA_PATH}. "
-                        "Run: python scripts/ingest.py"
-                    )
-                logger.info("Loading corpus from %s ...", DATA_PATH)
-                with open(DATA_PATH, encoding="utf-8") as f:
-                    data: list[dict] = json.load(f)
-                vecs = np.array(
-                    [item["embedding"] for item in data], dtype=np.float32
-                )
-                norms = np.linalg.norm(vecs, axis=1, keepdims=True)
-                _corpus_matrix = vecs / (norms + 1e-10)
-                _corpus = data
-                logger.info("Corpus loaded: %d chunks.", len(_corpus))
-    return _corpus, _corpus_matrix
+_vecs = np.array([item["embedding"] for item in _corpus], dtype=np.float32)
+_norms = np.linalg.norm(_vecs, axis=1, keepdims=True)
+_corpus_matrix: np.ndarray = _vecs / (_norms + 1e-10)
+del _vecs, _norms  # free the unnormalised copy
 
+logger.info("Corpus loaded: %d chunks.", len(_corpus))
 
 # ---------------------------------------------------------------------------
-# Core search logic (shared by both Vercel handler and FastAPI app)
+# Core search logic (shared by Vercel handler and FastAPI app)
 # ---------------------------------------------------------------------------
 
 
 def semantic_search(query: str, top_k: int = 5) -> list[dict]:
     """Return up to `top_k` results above MIN_SCORE for the given query."""
-    model = get_model()
-    corpus, matrix = get_corpus()
-
-    query_emb = list(model.embed([query]))[0].astype(np.float32)
+    query_emb = list(_model.embed([query]))[0].astype(np.float32)
     query_norm = query_emb / (np.linalg.norm(query_emb) + 1e-10)
-    scores = matrix @ query_norm
+    scores = _corpus_matrix @ query_norm
 
     top_indices = np.argsort(scores)[::-1][:top_k]
 
     return [
         {
-            "text": corpus[i]["text"],
-            "page": corpus[i]["page"],
-            "source": corpus[i]["source"],
+            "text": _corpus[i]["text"],
+            "page": _corpus[i]["page"],
+            "source": _corpus[i]["source"],
             "score": float(scores[i]),
         }
         for i in top_indices
@@ -166,11 +145,7 @@ class handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        body = json.dumps({
-            "status": "ok",
-            "corpus_loaded": _corpus is not None,
-            "model_loaded": _model is not None,
-        }).encode()
+        body = json.dumps({"status": "ok"}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -211,15 +186,10 @@ class handler(BaseHTTPRequestHandler):
                 return
 
             self._send_event({"type": "start", "total": len(results)})
-
             for i, result in enumerate(results):
                 self._send_event({"type": "result", "index": i, **result})
-
             self._send_event({"type": "done"})
 
-        except FileNotFoundError as e:
-            logger.error("Corpus not found: %s", e)
-            self._send_event({"type": "error", "message": str(e)})
         except Exception:
             logger.exception("Search failed for query: %r", query)
             self._send_event({"type": "error", "message": "Search failed"})
@@ -265,7 +235,7 @@ def _make_fastapi_app():
 
     @_app.get("/health")
     async def health():
-        return {"status": "ok", "corpus_loaded": _corpus is not None, "model_loaded": _model is not None}
+        return {"status": "ok"}
 
     @_app.post("/search")
     @limiter.limit(RATE_LIMIT)
@@ -280,9 +250,6 @@ def _make_fastapi_app():
                 for i, result in enumerate(results):
                     yield f"data: {json.dumps({'type': 'result', 'index': i, **result})}\n\n"
                 yield f"data: {json.dumps({'type': 'done'})}\n\n"
-            except FileNotFoundError as e:
-                logger.error("Corpus not found: %s", e)
-                yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
             except Exception:
                 logger.exception("Search failed for query: %r", body.query)
                 yield f"data: {json.dumps({'type': 'error', 'message': 'Search failed'})}\n\n"
