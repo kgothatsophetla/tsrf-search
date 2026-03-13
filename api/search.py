@@ -1,21 +1,19 @@
 """
-Python backend for semantic search — production-grade FastAPI implementation.
-
-Local development:
-    python api/search.py
-    # or: uvicorn api.search:app --reload
-
-Docker:
-    docker compose up
+Python backend for semantic search.
 
 Vercel deployment:
-    Vercel picks up the `handler` name (Mangum wraps the ASGI app).
-    The `lifespan="off"` is required — Vercel does not call ASGI lifespan events.
+    Vercel's Python runtime only supports BaseHTTPRequestHandler — not ASGI/Mangum.
+    The `handler` class below is what Vercel invokes for every request.
+
+Docker / local:
+    Uses FastAPI + uvicorn (full production features: rate limiting, validation, etc.)
+    python api/search.py          # runs uvicorn
+    docker compose up
 
 Environment variables:
     CORS_ORIGINS   Comma-separated allowed origins. Default: "*"
     MIN_SCORE      Minimum cosine similarity threshold. Default: 0.55
-    RATE_LIMIT     SlowAPI limit string. Default: "30/minute"
+    RATE_LIMIT     SlowAPI limit string (Docker only). Default: "30/minute"
 """
 
 from __future__ import annotations
@@ -24,17 +22,10 @@ import json
 import logging
 import os
 import threading
+from http.server import BaseHTTPRequestHandler
 from typing import AsyncGenerator
 
 import numpy as np
-from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from mangum import Mangum
-from pydantic import BaseModel, Field, field_validator
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.errors import RateLimitExceeded
-from slowapi.util import get_remote_address
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -56,8 +47,8 @@ DATA_PATH = os.path.join(
     "chunks.json",
 )
 MIN_SCORE: float = float(os.environ.get("MIN_SCORE", "0.55"))
+CORS_ORIGINS: str = os.environ.get("CORS_ORIGINS", "*")
 RATE_LIMIT: str = os.environ.get("RATE_LIMIT", "30/minute")
-CORS_ORIGINS: list[str] = os.environ.get("CORS_ORIGINS", "*").split(",")
 
 # ---------------------------------------------------------------------------
 # Thread-safe lazy-loaded globals
@@ -76,7 +67,6 @@ def get_model():
         with _lock:
             if _model is None:
                 from fastembed import TextEmbedding
-
                 logger.info("Loading embedding model BAAI/bge-small-en-v1.5 ...")
                 _model = TextEmbedding("BAAI/bge-small-en-v1.5")
                 logger.info("Embedding model loaded.")
@@ -97,13 +87,10 @@ def get_corpus() -> tuple[list[dict], np.ndarray]:
                 logger.info("Loading corpus from %s ...", DATA_PATH)
                 with open(DATA_PATH, encoding="utf-8") as f:
                     data: list[dict] = json.load(f)
-
                 vecs = np.array(
                     [item["embedding"] for item in data], dtype=np.float32
                 )
                 norms = np.linalg.norm(vecs, axis=1, keepdims=True)
-                # Assign matrix before corpus so the outer `if _corpus is None`
-                # guard remains valid as the single sentinel.
                 _corpus_matrix = vecs / (norms + 1e-10)
                 _corpus = data
                 logger.info("Corpus loaded: %d chunks.", len(_corpus))
@@ -111,7 +98,7 @@ def get_corpus() -> tuple[list[dict], np.ndarray]:
 
 
 # ---------------------------------------------------------------------------
-# Core search logic
+# Core search logic (shared by both Vercel handler and FastAPI app)
 # ---------------------------------------------------------------------------
 
 
@@ -139,134 +126,178 @@ def semantic_search(query: str, top_k: int = 5) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# FastAPI app
-# ---------------------------------------------------------------------------
-
-limiter = Limiter(key_func=get_remote_address, default_limits=[RATE_LIMIT])
-
-app = FastAPI(title="TSRF Semantic Search", version="1.0.0")
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=CORS_ORIGINS,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type"],
-)
-
-# ---------------------------------------------------------------------------
-# Startup preload (works on both uvicorn lifespan and Vercel cold-starts)
-# Vercel does NOT invoke ASGI lifespan, so we trigger loading on the first
-# real request via middleware instead of @app.on_event("startup").
-# ---------------------------------------------------------------------------
-
-_startup_done = False
-_startup_lock = threading.Lock()
-
-
-@app.middleware("http")
-async def preload_on_first_request(request: Request, call_next):
-    global _startup_done
-    if not _startup_done:
-        with _startup_lock:
-            if not _startup_done:
-                try:
-                    get_model()
-                    get_corpus()
-                    _startup_done = True
-                except Exception:
-                    logger.exception("Startup preload failed — will retry on next request.")
-    return await call_next(request)
-
-
-# ---------------------------------------------------------------------------
-# Pydantic request model
+# Vercel handler — BaseHTTPRequestHandler (the only format Vercel supports)
 # ---------------------------------------------------------------------------
 
 
-class SearchRequest(BaseModel):
-    query: str = Field(..., min_length=1, max_length=500)
-    top_k: int = Field(default=5, ge=1, le=10)
+class handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        logger.info(fmt, *args)
 
-    @field_validator("query")
-    @classmethod
-    def strip_and_validate(cls, v: str) -> str:
-        v = v.strip()
-        if not v:
-            raise ValueError("query must not be blank or whitespace-only")
-        return v
+    def _cors(self):
+        self.send_header("Access-Control-Allow-Origin", CORS_ORIGINS)
+        self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
 
+    def _json_error(self, status: int, message: str):
+        body = json.dumps({"error": message}).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self._cors()
+        self.end_headers()
+        self.wfile.write(body)
 
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
+    def _send_event(self, data: dict):
+        msg = f"data: {json.dumps(data)}\n\n".encode()
+        self.wfile.write(msg)
+        self.wfile.flush()
 
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self._cors()
+        self.end_headers()
 
-@app.get("/health")
-@app.get("/api/health")
-@app.get("/")
-async def health():
-    """Readiness probe — reports whether corpus and model are loaded."""
-    return {
-        "status": "ok",
-        "corpus_loaded": _corpus is not None,
-        "model_loaded": _model is not None,
-    }
+    def do_GET(self):
+        body = json.dumps({
+            "status": "ok",
+            "corpus_loaded": _corpus is not None,
+            "model_loaded": _model is not None,
+        }).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self._cors()
+        self.end_headers()
+        self.wfile.write(body)
 
-
-@app.post("/search")
-@app.post("/api/search")
-@limiter.limit(RATE_LIMIT)
-async def search(request: Request, body: SearchRequest):
-    """Stream semantic search results as Server-Sent Events."""
-
-    async def event_stream() -> AsyncGenerator[str, None]:
+    def do_POST(self):
         try:
-            results = semantic_search(body.query, body.top_k)
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length))
+            query = str(body.get("query", "")).strip()
+            top_k = min(max(int(body.get("top_k", 5)), 1), 10)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            self._json_error(400, "Invalid request body")
+            return
+
+        if not query:
+            self._json_error(400, "Query is required")
+            return
+
+        if len(query) > 500:
+            self._json_error(400, "Query too long (max 500 characters)")
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self._cors()
+        self.end_headers()
+
+        try:
+            results = semantic_search(query, top_k)
 
             if not results:
-                yield f"data: {json.dumps({'type': 'no_knowledge'})}\n\n"
+                self._send_event({"type": "no_knowledge"})
                 return
 
-            yield f"data: {json.dumps({'type': 'start', 'total': len(results)})}\n\n"
+            self._send_event({"type": "start", "total": len(results)})
 
             for i, result in enumerate(results):
-                yield f"data: {json.dumps({'type': 'result', 'index': i, **result})}\n\n"
+                self._send_event({"type": "result", "index": i, **result})
 
-            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+            self._send_event({"type": "done"})
 
         except FileNotFoundError as e:
             logger.error("Corpus not found: %s", e)
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+            self._send_event({"type": "error", "message": str(e)})
         except Exception:
-            logger.exception("Search failed for query: %r", body.query)
-            yield f"data: {json.dumps({'type': 'error', 'message': 'Search failed'})}\n\n"
+            logger.exception("Search failed for query: %r", query)
+            self._send_event({"type": "error", "message": "Search failed"})
 
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
+
+# ---------------------------------------------------------------------------
+# FastAPI app — used by Docker / uvicorn only
+# ---------------------------------------------------------------------------
+
+
+def _make_fastapi_app():
+    from fastapi import FastAPI, Request
+    from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.responses import StreamingResponse
+    from pydantic import BaseModel, Field, field_validator
+    from slowapi import Limiter, _rate_limit_exceeded_handler
+    from slowapi.errors import RateLimitExceeded
+    from slowapi.util import get_remote_address
+
+    limiter = Limiter(key_func=get_remote_address, default_limits=[RATE_LIMIT])
+
+    _app = FastAPI(title="TSRF Semantic Search", version="1.0.0")
+    _app.state.limiter = limiter
+    _app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    _app.add_middleware(
+        CORSMiddleware,
+        allow_origins=CORS_ORIGINS.split(","),
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["Content-Type"],
     )
 
+    class SearchRequest(BaseModel):
+        query: str = Field(..., min_length=1, max_length=500)
+        top_k: int = Field(default=5, ge=1, le=10)
+
+        @field_validator("query")
+        @classmethod
+        def strip_and_validate(cls, v: str) -> str:
+            v = v.strip()
+            if not v:
+                raise ValueError("query must not be blank")
+            return v
+
+    @_app.get("/health")
+    async def health():
+        return {"status": "ok", "corpus_loaded": _corpus is not None, "model_loaded": _model is not None}
+
+    @_app.post("/search")
+    @limiter.limit(RATE_LIMIT)
+    async def search(request: Request, body: SearchRequest):
+        async def event_stream() -> AsyncGenerator[str, None]:
+            try:
+                results = semantic_search(body.query, body.top_k)
+                if not results:
+                    yield f"data: {json.dumps({'type': 'no_knowledge'})}\n\n"
+                    return
+                yield f"data: {json.dumps({'type': 'start', 'total': len(results)})}\n\n"
+                for i, result in enumerate(results):
+                    yield f"data: {json.dumps({'type': 'result', 'index': i, **result})}\n\n"
+                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+            except FileNotFoundError as e:
+                logger.error("Corpus not found: %s", e)
+                yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+            except Exception:
+                logger.exception("Search failed for query: %r", body.query)
+                yield f"data: {json.dumps({'type': 'error', 'message': 'Search failed'})}\n\n"
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    return _app
+
 
 # ---------------------------------------------------------------------------
-# Vercel serverless handler (Mangum wraps the ASGI app)
-# ---------------------------------------------------------------------------
-
-handler = Mangum(app, lifespan="off")
-
-# ---------------------------------------------------------------------------
-# Local development entry point
+# Local development / Docker entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import sys
-
     import uvicorn
 
+    app = _make_fastapi_app()
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
-    uvicorn.run("search:app", host="0.0.0.0", port=port, reload=False)
+    logger.info("Starting uvicorn on http://0.0.0.0:%d", port)
+    uvicorn.run(app, host="0.0.0.0", port=port)
