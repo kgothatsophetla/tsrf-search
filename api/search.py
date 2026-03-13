@@ -205,6 +205,7 @@ class SearchRequest(BaseModel):
 
 @app.get("/health")
 @app.get("/api/health")
+@app.get("/")
 async def health():
     """Readiness probe — reports whether corpus and model are loaded."""
     return {
@@ -215,6 +216,7 @@ async def health():
 
 
 @app.post("/search")
+@app.post("/api/search")
 @limiter.limit(RATE_LIMIT)
 async def search(request: Request, body: SearchRequest):
     """Stream semantic search results as Server-Sent Events."""
