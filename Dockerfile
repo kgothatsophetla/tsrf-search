@@ -35,13 +35,13 @@ COPY --from=builder /install /usr/local
 #   /app/api/search.py  →  /app/data/chunks.json
 COPY api/search.py ./api/search.py
 COPY data/chunks.json ./data/chunks.json
+COPY models/ ./models/
 
 USER appuser
 
 EXPOSE 8000
 
-# HEALTHCHECK start-period is generous (60 s) because fastembed downloads the
-# ONNX model on the first get_model() call, which can take 10–30 seconds.
+# Model is pre-bundled — no download needed. Start-period can be shorter now.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
 

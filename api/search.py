@@ -68,8 +68,13 @@ def get_model():
             if _model is None:
                 from fastembed import TextEmbedding
                 logger.info("Loading embedding model BAAI/bge-small-en-v1.5 ...")
-                # Vercel's filesystem is read-only except /tmp — set cache there.
-                cache_dir = os.environ.get("FASTEMBED_CACHE_PATH", "/tmp/fastembed")
+                # Use the bundled model directory so Vercel never downloads at runtime.
+                # Falls back to FASTEMBED_CACHE_PATH env var for local dev without the bundle.
+                _bundled = os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                    "models",
+                )
+                cache_dir = os.environ.get("FASTEMBED_CACHE_PATH", _bundled)
                 _model = TextEmbedding("BAAI/bge-small-en-v1.5", cache_dir=cache_dir)
                 logger.info("Embedding model loaded.")
     return _model
@@ -216,10 +221,8 @@ class handler(BaseHTTPRequestHandler):
             logger.error("Corpus not found: %s", e)
             self._send_event({"type": "error", "message": str(e)})
         except Exception:
-            import traceback
-            err = traceback.format_exc()
             logger.exception("Search failed for query: %r", query)
-            self._send_event({"type": "error", "message": f"Search failed: {err}"})
+            self._send_event({"type": "error", "message": "Search failed"})
 
 
 # ---------------------------------------------------------------------------
