@@ -5,8 +5,8 @@ import "./globals.css";
 const inter = Inter({ subsets: ["latin"] });
 
 export const metadata: Metadata = {
-  title: "TSRF Knowledge Base",
-  description: "Semantic search over the TSRF FAQ document",
+  title: "TSRF ULWAZI",
+  description: "Intelligence Made Simple, Ask Anything about TSRF",
 };
 
 export default function RootLayout({

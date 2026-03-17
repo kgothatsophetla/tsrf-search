@@ -1,30 +1,24 @@
 """
-Python backend for semantic search.
+Context-aware answer endpoint.
 
-Vercel deployment:
-    Vercel's Python runtime only supports BaseHTTPRequestHandler — not ASGI/Mangum.
-    The `handler` class below is what Vercel invokes for every request.
-    Model + corpus are loaded at module level so they are ready before the first
-    request (Lambda INIT phase), eliminating first-request latency.
+Performs semantic search over the TSRF Q&A corpus and returns the
+pre-written answer for the best-matching FAQ question.
 
-Docker / local:
-    Uses FastAPI + uvicorn (rate limiting, validation, etc.)
-    python api/search.py          # runs uvicorn
-    docker compose up
+No external API calls are made — all processing is fully local.
+The embeddings model and corpus are loaded at module level (Lambda INIT
+phase on Vercel) to avoid first-request latency.
 
 Environment variables:
     CORS_ORIGINS   Comma-separated allowed origins. Default: "*"
     MIN_SCORE      Minimum cosine similarity threshold. Default: 0.55
-    RATE_LIMIT     SlowAPI limit string (Docker only). Default: "30/minute"
 """
-
-from __future__ import annotations
 
 import json
 import logging
 import os
+import time
 from http.server import BaseHTTPRequestHandler
-from typing import AsyncGenerator
+from typing import Optional, List
 
 import numpy as np
 
@@ -36,7 +30,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-logger = logging.getLogger("search")
+logger = logging.getLogger("answer")
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -53,13 +47,9 @@ _BUNDLED_MODELS = os.path.join(
 )
 MIN_SCORE: float = float(os.environ.get("MIN_SCORE", "0.55"))
 CORS_ORIGINS: str = os.environ.get("CORS_ORIGINS", "*")
-RATE_LIMIT: str = os.environ.get("RATE_LIMIT", "30/minute")
 
 # ---------------------------------------------------------------------------
 # Module-level initialisation
-# On Vercel/Lambda, module init runs in the INIT phase — before the first
-# request. Loading here means the first request pays no setup cost.
- n # On plain uvicorn the effect is the same: ready before serving traffic.
 # ---------------------------------------------------------------------------
 
 logger.info("Initialising model and corpus ...")
@@ -82,12 +72,12 @@ with open(DATA_PATH, encoding="utf-8") as _f:
 _vecs = np.array([item["embedding"] for item in _corpus], dtype=np.float32)
 _norms = np.linalg.norm(_vecs, axis=1, keepdims=True)
 _corpus_matrix: np.ndarray = _vecs / (_norms + 1e-10)
-del _vecs, _norms  # free the unnormalised copy
+del _vecs, _norms
 
-logger.info("Corpus loaded: %d chunks.", len(_corpus))
+logger.info("Corpus loaded: %d items.", len(_corpus))
 
 # ---------------------------------------------------------------------------
-# Core search logic (shared by Vercel handler and FastAPI app)
+# Core logic
 # ---------------------------------------------------------------------------
 
 
@@ -96,23 +86,96 @@ def semantic_search(query: str, top_k: int = 5) -> list[dict]:
     query_emb = list(_model.embed([query]))[0].astype(np.float32)
     query_norm = query_emb / (np.linalg.norm(query_emb) + 1e-10)
     scores = _corpus_matrix @ query_norm
-
     top_indices = np.argsort(scores)[::-1][:top_k]
 
-    return [
-        {
+    results = []
+    for idx, i in enumerate(top_indices):
+        if float(scores[i]) < MIN_SCORE:
+            continue
+        entry = {
             "text": _corpus[i]["text"],
             "page": _corpus[i]["page"],
             "source": _corpus[i]["source"],
             "score": float(scores[i]),
+            "index": idx,
         }
-        for i in top_indices
-        if float(scores[i]) >= MIN_SCORE
-    ]
+        # Include the matched question if this is a Q&A corpus entry
+        if "question" in _corpus[i]:
+            entry["question"] = _corpus[i]["question"]
+        results.append(entry)
+
+    return results
+
+
+_FOLLOWUP_PREFIXES = (
+    "what about", "and ", "also ", "tell me more",
+    "more about", "how about", "what of",
+    "can you explain", "elaborate on",
+)
+
+
+def enrich_query(query: str, history: list[dict]) -> str:
+    """
+    Detect follow-up queries and expand them with context from the most recent
+    matched corpus question in history.
+
+    A query is treated as a follow-up if it is very short (≤4 words) or starts
+    with a conversational continuation phrase. In that case the most recent
+    matched_question from history is appended so the embedding search has enough
+    context to find the right FAQ entry.
+    """
+    if not history:
+        return query
+
+    q_lower = query.lower().strip()
+    is_followup = len(q_lower.split()) <= 4 or any(
+        q_lower.startswith(p) for p in _FOLLOWUP_PREFIXES
+    )
+
+    if not is_followup:
+        return query
+
+    for entry in reversed(history):
+        context = entry.get("matched_question", "")
+        if context:
+            enriched = f"{query} {context}".strip()[:500]
+            logger.info("Enriched query %r -> %r", query, enriched)
+            return enriched
+
+    return query
+
+
+def generate_answer(query: str, top_k: int = 5, history: Optional[List[dict]] = None):
+    """
+    Generator yielding SSE-compatible dicts:
+      {"type": "sources", "results": [...]}   — matched corpus entries
+      {"type": "answer",  "text": "..."}      — answer text
+      {"type": "done"}
+    or:
+      {"type": "no_knowledge"}
+    """
+    effective_query = enrich_query(query, history or [])
+    results = semantic_search(effective_query, top_k)
+
+    if not results:
+        yield {"type": "no_knowledge"}
+        return
+
+    yield {"type": "sources", "results": results}
+
+    # Stream the answer 3 characters at a time — natural typewriter feel
+    text = results[0]["text"]
+    accumulated = ""
+    for i in range(0, len(text), 3):
+        accumulated += text[i:i + 3]
+        yield {"type": "answer", "text": accumulated}
+        time.sleep(0.012)
+
+    yield {"type": "done"}
 
 
 # ---------------------------------------------------------------------------
-# Vercel handler — BaseHTTPRequestHandler (the only format Vercel supports)
+# Vercel handler
 # ---------------------------------------------------------------------------
 
 
@@ -159,6 +222,8 @@ class handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(length))
             query = str(body.get("query", "")).strip()
             top_k = min(max(int(body.get("top_k", 5)), 1), 10)
+            history_raw = body.get("history", [])
+            history = history_raw[-3:] if isinstance(history_raw, list) else []
         except (json.JSONDecodeError, ValueError, TypeError):
             self._json_error(400, "Invalid request body")
             return
@@ -179,29 +244,22 @@ class handler(BaseHTTPRequestHandler):
         self.end_headers()
 
         try:
-            results = semantic_search(query, top_k)
-
-            if not results:
-                self._send_event({"type": "no_knowledge"})
-                return
-
-            self._send_event({"type": "start", "total": len(results)})
-            for i, result in enumerate(results):
-                self._send_event({"type": "result", "index": i, **result})
-            self._send_event({"type": "done"})
-
+            for event in generate_answer(query, top_k, history):
+                self._send_event(event)
         except Exception:
-            logger.exception("Search failed for query: %r", query)
-            self._send_event({"type": "error", "message": "Search failed"})
+            logger.exception("Answer generation failed for query: %r", query)
+            self._send_event({"type": "error", "message": "Answer generation failed"})
 
 
 # ---------------------------------------------------------------------------
-# FastAPI app — used by Docker / uvicorn only
+# FastAPI app — used by Docker / local dev (uvicorn)
 # ---------------------------------------------------------------------------
 
 
 def _make_fastapi_app():
-    from fastapi import FastAPI, Request
+    from typing import AsyncGenerator
+
+    from fastapi import FastAPI
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import StreamingResponse
     from pydantic import BaseModel, Field, field_validator
@@ -209,9 +267,10 @@ def _make_fastapi_app():
     from slowapi.errors import RateLimitExceeded
     from slowapi.util import get_remote_address
 
+    RATE_LIMIT = os.environ.get("RATE_LIMIT", "30/minute")
     limiter = Limiter(key_func=get_remote_address, default_limits=[RATE_LIMIT])
 
-    _app = FastAPI(title="TSRF Semantic Search", version="1.0.0")
+    _app = FastAPI(title="TSRF Answer API", version="1.0.0")
     _app.state.limiter = limiter
     _app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
     _app.add_middleware(
@@ -221,9 +280,14 @@ def _make_fastapi_app():
         allow_headers=["Content-Type"],
     )
 
-    class SearchRequest(BaseModel):
+    class HistoryEntryModel(BaseModel):
+        question: str = Field(default="", max_length=500)
+        matched_question: str = Field(default="", max_length=500)
+
+    class AnswerRequest(BaseModel):
         query: str = Field(..., min_length=1, max_length=500)
         top_k: int = Field(default=5, ge=1, le=10)
+        history: list[HistoryEntryModel] = Field(default_factory=list)
 
         @field_validator("query")
         @classmethod
@@ -237,21 +301,13 @@ def _make_fastapi_app():
     async def health():
         return {"status": "ok"}
 
-    @_app.post("/search")
-    async def search(request: Request, body: SearchRequest):
+    @_app.post("/answer")
+    async def answer(body: AnswerRequest):
+        history_dicts = [h.model_dump() for h in body.history[-3:]]
+
         async def event_stream() -> AsyncGenerator[str, None]:
-            try:
-                results = semantic_search(body.query, body.top_k)
-                if not results:
-                    yield f"data: {json.dumps({'type': 'no_knowledge'})}\n\n"
-                    return
-                yield f"data: {json.dumps({'type': 'start', 'total': len(results)})}\n\n"
-                for i, result in enumerate(results):
-                    yield f"data: {json.dumps({'type': 'result', 'index': i, **result})}\n\n"
-                yield f"data: {json.dumps({'type': 'done'})}\n\n"
-            except Exception:
-                logger.exception("Search failed for query: %r", body.query)
-                yield f"data: {json.dumps({'type': 'error', 'message': 'Search failed'})}\n\n"
+            for event in generate_answer(body.query, body.top_k, history_dicts):
+                yield f"data: {json.dumps(event)}\n\n"
 
         return StreamingResponse(
             event_stream(),

@@ -3,10 +3,10 @@
 import { useEffect, useRef, useState } from "react";
 import ChatInput from "@/components/ChatInput";
 import ChatMessage from "@/components/ChatMessage";
-import type { AssistantMessage, Message, SearchResult } from "@/lib/types";
+import type { AssistantMessage, HistoryEntry, Message, SearchResult } from "@/lib/types";
 
 const SUGGESTED = [
-  "What is TSRF?",
+  "ZDM CHALLENGES",
   "How do I submit a claim?",
   "What documents do I need for a death claim?",
   "How do I check my fund balance?",
@@ -30,6 +30,7 @@ function parseSSEBuffer(buffer: string): { events: unknown[]; remainder: string 
 export default function Page() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
+  const [conversationHistory, setConversationHistory] = useState<HistoryEntry[]>([]);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -47,27 +48,31 @@ export default function Page() {
 
     const userId = crypto.randomUUID();
     const assistantId = crypto.randomUUID();
+    const historySnapshot = conversationHistory;
 
     setMessages((prev) => [
       ...prev,
       { id: userId, role: "user", text },
-      { id: assistantId, role: "assistant", results: [], status: "loading" },
+      { id: assistantId, role: "assistant", answer: "", results: [], status: "loading" },
     ]);
 
     setIsStreaming(true);
 
+    let capturedMatchedQuestion: string | undefined;
+    let capturedAnswer = "";
+
     try {
-      const response = await fetch("/api/search", {
+      const response = await fetch("/api/answer", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: text, top_k: 5 }),
+        body: JSON.stringify({ query: text, top_k: 5, history: historySnapshot }),
       });
 
       if (!response.ok || !response.body) {
         updateAssistant(assistantId, (m) => ({
           ...m,
           status: "error",
-          error: "Search request failed. Is the API server running?",
+          error: "Request failed. Is the API server running?",
         }));
         return;
       }
@@ -88,20 +93,32 @@ export default function Page() {
 
         for (const event of events) {
           const e = event as Record<string, unknown>;
-          if (e.type === "result") {
+
+          if (e.type === "sources") {
+            const results = e.results as SearchResult[];
+            capturedMatchedQuestion = results[0]?.question;
+            updateAssistant(assistantId, (m) => ({ ...m, results }));
+          } else if (e.type === "answer") {
+            capturedAnswer = e.text as string;
             updateAssistant(assistantId, (m) => ({
               ...m,
-              results: [...m.results, e as unknown as SearchResult],
+              answer: capturedAnswer,
             }));
           } else if (e.type === "done") {
             updateAssistant(assistantId, (m) => ({ ...m, status: "done" }));
+            setConversationHistory((prev) =>
+              [...prev, { question: text, matched_question: capturedMatchedQuestion, answer: capturedAnswer }].slice(-3)
+            );
           } else if (e.type === "no_knowledge") {
             updateAssistant(assistantId, (m) => ({ ...m, status: "no_knowledge" }));
+            setConversationHistory((prev) =>
+              [...prev, { question: text }].slice(-3)
+            );
           } else if (e.type === "error") {
             updateAssistant(assistantId, (m) => ({
               ...m,
               status: "error",
-              error: String(e.message ?? "Search failed"),
+              error: String(e.message ?? "Something went wrong"),
             }));
           }
         }
@@ -141,8 +158,8 @@ export default function Page() {
             </svg>
           </div>
           <div>
-            <h1 className="text-sm font-semibold text-gray-900">TSRF Knowledge Base</h1>
-            <p className="text-xs text-gray-500">Semantic search over the TSRF FAQ</p>
+            <h1 className="text-sm font-semibold text-gray-900">TSRF ULWAZI</h1>
+            <p className="text-xs text-gray-500">Intelligence Made Simple, Ask Anything about TSRF</p>
           </div>
         </div>
       </header>
@@ -168,10 +185,10 @@ export default function Page() {
                   </svg>
                 </div>
                 <h2 className="text-lg font-semibold text-gray-800">
-                  Ask anything about TSRF
+                  TSRF ULWAZI
                 </h2>
                 <p className="text-sm text-gray-400 mt-1 max-w-sm">
-                  Questions are matched semantically against the TSRF FAQ document.
+                  Intelligence Made Simple, Ask Anything about TSRF
                 </p>
               </div>
 

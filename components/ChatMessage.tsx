@@ -5,7 +5,7 @@ import type { AssistantMessage, Message, SearchResult, UserMessage } from "@/lib
 
 function TypingIndicator() {
   return (
-    <div className="flex items-center gap-1 px-1 h-8">
+    <div className="flex items-center gap-1 h-6">
       {[0, 1, 2].map((i) => (
         <span
           key={i}
@@ -17,102 +17,9 @@ function TypingIndicator() {
   );
 }
 
-function SourceCard({ result, position }: { result: SearchResult; position: number }) {
-  const pct = Math.round(result.score * 100);
-  const badge =
-    result.score >= 0.75
-      ? "bg-green-50 text-green-700"
-      : result.score >= 0.55
-      ? "bg-yellow-50 text-yellow-700"
-      : "bg-gray-100 text-gray-600";
-
-  return (
-    <div key={position} className="border border-gray-200 rounded-xl p-4 bg-white animate-slide-in">
-      <div className="flex items-center justify-between mb-2">
-        <span className="text-xs font-semibold text-gray-400 uppercase tracking-widest">
-          Source {result.index + 1}
-        </span>
-        <div className="flex items-center gap-2">
-          <span className="text-xs text-gray-400">Page {result.page}</span>
-          <span className={`text-xs font-medium px-2 py-0.5 rounded-full ${badge}`}>
-            {pct}% match
-          </span>
-        </div>
-      </div>
-      <p className="text-sm text-gray-700 leading-relaxed">{result.text}</p>
-      <p className="mt-3 text-xs text-gray-400 truncate">{result.source}</p>
-    </div>
-  );
-}
-
-function SourceCarousel({
-  results,
-  isStreaming,
-}: {
-  results: SearchResult[];
-  isStreaming: boolean;
-}) {
-  const [index, setIndex] = useState(0);
-
-  if (results.length === 0) return null;
-
-  const safeIndex = Math.min(index, results.length - 1);
-  const canPrev = safeIndex > 0;
-  const canNext = safeIndex < results.length - 1;
-
-  return (
-    <div className="space-y-3">
-      <SourceCard key={safeIndex} result={results[safeIndex]} position={safeIndex} />
-
-      <div className="flex items-center justify-between px-1">
-        <button
-          onClick={() => setIndex((i) => Math.max(0, i - 1))}
-          disabled={!canPrev}
-          className="w-8 h-8 rounded-full border border-gray-200 bg-white flex items-center justify-center hover:border-blue-400 hover:text-blue-600 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
-        >
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M15 18l-6-6 6-6" />
-          </svg>
-        </button>
-
-        <div className="flex items-center gap-1.5">
-          {results.map((_, i) => (
-            <button
-              key={i}
-              onClick={() => setIndex(i)}
-              className={`rounded-full transition-all ${
-                i === safeIndex
-                  ? "w-4 h-2 bg-blue-600"
-                  : "w-2 h-2 bg-gray-300 hover:bg-gray-400"
-              }`}
-            />
-          ))}
-          {isStreaming && (
-            <span className="w-2 h-2 rounded-full bg-gray-200 animate-pulse" />
-          )}
-        </div>
-
-        <button
-          onClick={() => setIndex((i) => Math.min(results.length - 1, i + 1))}
-          disabled={!canNext}
-          className="w-8 h-8 rounded-full border border-gray-200 bg-white flex items-center justify-center hover:border-blue-400 hover:text-blue-600 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
-        >
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M9 18l6-6-6-6" />
-          </svg>
-        </button>
-      </div>
-
-      <p className="text-center text-xs text-gray-400">
-        {safeIndex + 1} of {results.length}{isStreaming ? "+" : ""}
-      </p>
-    </div>
-  );
-}
-
 function AssistantAvatar() {
   return (
-    <div className="w-7 h-7 rounded-full bg-blue-600 flex items-center justify-center flex-shrink-0 mt-0.5">
+    <div className="w-7 h-7 rounded-full bg-blue-600 flex items-center justify-center flex-shrink-0 mt-1">
       <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
         <circle cx="11" cy="11" r="8" />
         <path d="m21 21-4.35-4.35" />
@@ -131,37 +38,89 @@ function UserBubble({ message }: { message: UserMessage }) {
   );
 }
 
-function AssistantBubble({ message }: { message: AssistantMessage }) {
-  const { results, status, error } = message;
-  const isStreaming = status === "streaming";
+function AnswerText({ text }: { text: string }) {
+  // Render plain text preserving newlines
+  return (
+    <div className="text-sm text-gray-800 leading-relaxed whitespace-pre-wrap">
+      {text}
+    </div>
+  );
+}
+
+function SourcesToggle({ results }: { results: SearchResult[] }) {
+  const [open, setOpen] = useState(false);
+
+  if (results.length === 0) return null;
+
+  return (
+    <div className="mt-3 pt-3 border-t border-gray-100">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className="flex items-center gap-1.5 text-xs text-gray-400 hover:text-gray-600 transition-colors"
+      >
+        <svg
+          width="12"
+          height="12"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          className={`transition-transform ${open ? "rotate-90" : ""}`}
+        >
+          <path d="M9 18l6-6-6-6" />
+        </svg>
+        {results.length} source{results.length !== 1 ? "s" : ""}
+      </button>
+
+      {open && (
+        <ul className="mt-2 space-y-1.5">
+          {results.map((r, i) => (
+            <li key={i} className="flex items-start gap-2 text-xs text-gray-500">
+              <span className="mt-0.5 text-gray-300">•</span>
+              <span>
+                {r.question ? (
+                  <span className="text-blue-500">{r.question}</span>
+                ) : (
+                  r.text.slice(0, 80) + (r.text.length > 80 ? "…" : "")
+                )}
+                <span className="ml-1.5 text-gray-400">— p.{r.page}</span>
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function AssistantMessage_({ message }: { message: AssistantMessage }) {
+  const { answer, results, status, error } = message;
 
   return (
     <div className="flex gap-3">
       <AssistantAvatar />
-      <div className="flex-1 min-w-0 space-y-3">
+      <div className="flex-1 min-w-0 py-1">
         {status === "loading" && <TypingIndicator />}
 
         {(status === "streaming" || status === "done") && (
-          <div className="space-y-3">
-            <p className="text-xs text-gray-500">
-              {status === "done"
-                ? `Found ${results.length} relevant passage${results.length !== 1 ? "s" : ""}`
-                : "Retrieving relevant passages..."}
-            </p>
-            <SourceCarousel results={results} isStreaming={isStreaming} />
-          </div>
+          <>
+            <AnswerText text={answer} />
+            <SourcesToggle results={results} />
+          </>
         )}
 
         {status === "no_knowledge" && (
-          <div className="text-sm text-gray-600 bg-white border border-gray-200 rounded-2xl rounded-tl-sm px-4 py-3 leading-relaxed">
-            We do not have sufficient knowledge in our database to answer that question.
-          </div>
+          <p className="text-sm text-gray-500 leading-relaxed">
+            Sorry we are unable to assist with your enquiry. Please contact the Fund Call Centre on 087 405 6377 or visit one of the Fund Walk-in Centres. Go to our Contact page to see the details of the various Walk-in Centres.
+          </p>
         )}
 
         {status === "error" && (
-          <div className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-2xl rounded-tl-sm px-4 py-3">
+          <p className="text-sm text-red-500 leading-relaxed">
             {error ?? "Something went wrong. Please try again."}
-          </div>
+          </p>
         )}
       </div>
     </div>
@@ -170,5 +129,5 @@ function AssistantBubble({ message }: { message: AssistantMessage }) {
 
 export default function ChatMessage({ message }: { message: Message }) {
   if (message.role === "user") return <UserBubble message={message} />;
-  return <AssistantBubble message={message} />;
+  return <AssistantMessage_ message={message} />;
 }

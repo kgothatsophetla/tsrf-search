@@ -1,6 +1,10 @@
 {
   "rewrites": [
     {
+      "source": "/api/answer",
+      "destination": "/api/answer"
+    },
+    {
       "source": "/api/:path*",
       "destination": "/api/search"
     }
